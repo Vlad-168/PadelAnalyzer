@@ -726,182 +726,249 @@ class EventDetector:
     """
     Определяет виннеры и ошибки по траектории мяча + позициям игроков.
 
-    Логика:
-    ─────
-    ПОСЛЕДНИЙ ИГРОК (last_hitter):
-        Игрок, который был ближе всех к мячу в момент, когда мяч
-        резко изменил направление (удар или отскок от стекла).
-        Обновляется не чаще чем раз в 0.4 сек.
+    Ключевые улучшения v2:
+    ──────────────────────
+    1. ИСКЛЮЧЕНИЕ ОТСКОКОВ ОТ СТЕКЛА (_near_wall):
+       Падел — уникальная игра: мяч может отскакивать от стеклянных стен
+       и это ЛЕГАЛЬНЫЙ удар.  Когда мяч меняет направление вблизи границы
+       корта (< WALL_MARGIN px), это отскок от стекла, а не удар игрока →
+       last_hitter НЕ обновляется.
 
-    ОШИБКА В СЕТКУ (net_error):
-        Вектор последних N позиций мяча пересекает линию сетки И
-        мяч резко замедляется (speed < NET_STOP_SPEED) → мяч застрял в сетке.
+    2. ТРЕКИНГ ПИКОВОЙ СКОРОСТИ НА СТОРОНЕ СОПЕРНИКА (_max_speed_opp):
+       Вместо булевого флага _was_flying отслеживаем максимальную скорость
+       мяча на стороне соперника с момента перелёта через сетку.
+       Виннер фиксируется только если пиковая скорость > WINNER_MIN_SPEED_OPP.
+       Это надёжнее: кратковременная «медленность» в одном кадре не теряет
+       информацию о том, что мяч был разогнан.
 
-    ОШИБКА В АУТ (out_error):
-        Позиция мяча оказывается за пределами полигона корта И
-        мяч при этом не летел через стену (скорость достаточная → это не
-        отскок от стекла; нельзя определить точно, но делаем cooldown).
+    3. ПОДТВЕРЖДЕНИЕ ВИННЕРА ПО N МЕДЛЕННЫМ КАДРАМ ПОДРЯД (_slow_frames):
+       Виннер не засчитывается после единственного «медленного» кадра.
+       Требуется WINNER_SLOW_FRAMES кадров подряд со скоростью < WINNER_BOUNCE_SPEED.
+       Защита от кратковременных провалов скорости в середине ралли.
 
-    ВИННЕР:
-        Мяч приземлился на стороне соперника (crossed_net=True) И
-        скорость упала (отскок/остановка) И все соперники были
-        дальше WINNER_DIST пикселей в момент остановки мяча.
+    4. ПРОВЕРКА НАПРАВЛЕНИЯ ДЛЯ ОШИБКИ В СЕТКУ:
+       Мяч должен двигаться В СТОРОНУ сетки (не параллельно и не от неё).
+       Фильтрует ложные срабатывания на медленных мячах у сетки со стороны
+       соперника.
+
+    5. ПОРОГ СКОРОСТИ ДЛЯ ОШИБКИ В АУТ (OUT_SPEED_MIN):
+       Мяч должен реально двигаться (не статичный шум детектора).
+
+    6. НЕЗАВИСИМЫЕ КУЛДАУНЫ ПО ТИПУ СОБЫТИЯ:
+       Ошибка в сетку, ошибка в аут и виннер — разные cooldown-таймеры.
+       Одна ошибка не блокирует регистрацию виннера в той же точке ралли.
     """
 
-    CONTACT_DIST     = 120   # px (было 85): YOLO даёт центр тела, ракетка дальше
-    CONTACT_COOLDOWN = 0.6   # сек (было 0.4)
-    NET_STOP_SPEED   = 1.5   # px/frame (было 4.0): мяч должен действительно замереть у сетки
-    NET_ZONE_PX      = 40    # px (было 55): строже — сетка — конкретная линия
-    WINNER_DIST      = 200   # px (было 130): на падел-корте соперники могут быть далеко
-    OUT_MARGIN       = -30   # px (было -12): исключаем шум трекера — мяч явно за кортом
-    OUT_MIN_FRAMES   = 2     # кадров подряд за кортом → только тогда аут
-    SPEED_BOUNCE     = 4.0   # px/frame (было 8.0): мяч замедлился после отскока
-    SPEED_FLYING     = 15.0  # px/frame: новый — мяч считается «в полёте» выше этого порога
-    EVENT_COOLDOWN   = 2.0   # сек (было 1.5): минимум между событиями
+    # ── Контакт / идентификация бьющего ──────────────────────────────────
+    CONTACT_DIST         = 120   # px: расстояние мяч→игрок для регистрации удара
+    CONTACT_COOLDOWN     = 0.6   # сек: защита от повторных регистраций
+    WALL_MARGIN          = 45    # px: внутри корта, но близко к границе → стекло
+
+    # ── Ошибка в сетку ───────────────────────────────────────────────────
+    NET_ZONE_PX          = 55    # px: зона «у сетки»
+    NET_STOP_SPEED       = 2.5   # px/кадр: мяч считается остановившимся у сетки
+
+    # ── Ошибка в аут ─────────────────────────────────────────────────────
+    OUT_MARGIN           = -25   # px: должен быть так далеко за полигоном корта
+    OUT_MIN_FRAMES       = 2     # кадров подряд за кортом для подтверждения
+    OUT_SPEED_MIN        = 2.0   # px/кадр: мяч должен двигаться (не шум)
+
+    # ── Виннер ───────────────────────────────────────────────────────────
+    WINNER_DIST          = 180   # px: соперники дальше этого → виннер
+    WINNER_MIN_SPEED_OPP = 10.0  # px/кадр: минимальная пиковая скорость на стороне соперника
+    WINNER_BOUNCE_SPEED  = 5.0   # px/кадр: «остановка» после отскока
+    WINNER_SLOW_FRAMES   = 2     # кадров подряд медленных для подтверждения отскока
+
+    # ── Независимые кулдауны ─────────────────────────────────────────────
+    COOLDOWN_NET         = 2.0   # сек между ошибками в сетку
+    COOLDOWN_OUT         = 2.0   # сек между ошибками в аут
+    COOLDOWN_WINNER      = 2.5   # сек между виннерами
 
     def __init__(self, calib: CourtCalibration):
         self.calib  = calib
-        self.stats: dict = {}   # pid -> {winners, net_errors, out_errors}
+        self.stats: dict = {}              # pid -> {winners, net_errors, out_errors}
+        self._hist: deque = deque(maxlen=30)  # (ts, x, y)
 
-        self._hist: deque = deque(maxlen=30)   # (ts, x, y)
         self._last_hitter:  int | None = None
         self._last_hit_ts:  float      = -999.0
-        self._crossed_net:  bool       = False  # мяч перелетел на сторону соперника
-        self._event_cooldown: float    = -999.0 # ts последнего зафиксированного события
-        # ── Новые поля для точного определения событий ──────────────────
-        self._hitter_side:  int | None = None   # net_side() бьющего в момент удара
-        self._out_frames:   int        = 0      # кадров подряд мяч за кортом
-        self._was_flying:   bool       = False  # мяч был в полёте на стороне соперника
+        self._crossed_net:  bool       = False
+        self._hitter_side:  int | None = None
+
+        # ── Независимые кулдауны ─────────────────────────────────────────
+        self._ts_net:       float = -999.0
+        self._ts_out:       float = -999.0
+        self._ts_winner:    float = -999.0
+
+        # ── Трекинг виннера ──────────────────────────────────────────────
+        self._max_speed_opp: float = 0.0  # пиковая скорость на стороне соперника
+        self._slow_frames:   int   = 0    # кадров подряд со скоростью < WINNER_BOUNCE_SPEED
+
+        # ── Трекинг аута ─────────────────────────────────────────────────
+        self._out_frames: int = 0         # кадров подряд мяч за кортом
 
     def register(self, pid: int):
         self.stats.setdefault(pid, {"winners": 0, "net_errors": 0, "out_errors": 0})
 
     def update(self, ball_px: tuple | None,
-               player_px: dict,    # pid -> (px, py)  в пикселях
-               team_map:  dict,    # pid -> team_name
+               player_px: dict,   # pid -> (px, py) в пикселях
+               team_map:  dict,   # pid -> team_name
                ts:        float):
 
         if ball_px:
             self._hist.append((ts, ball_px[0], ball_px[1]))
         else:
-            self._out_frames = 0   # мяч не виден — не накапливаем счётчик аута
+            self._out_frames = 0   # мяч не виден — сбрасываем счётчик аута
 
         if len(self._hist) < 4:
             return
 
         if ball_px:
             self._try_set_hitter(ball_px, player_px, ts)
-            self._check_crossed_net(ts)
+            self._check_crossed_net()
             self._check_net_error(ball_px, ts)
             self._check_out_error(ball_px, ts)
             self._check_winner(ball_px, player_px, team_map, ts)
 
-    # ── Вспомогательные методы ─────────────────────────────────────────
+    # ── Вспомогательные: скорость ─────────────────────────────────────────
 
     def _velocity(self, n: int = 3) -> tuple:
-        """Средний вектор скорости по последним n точкам."""
+        """Средний вектор скорости по последним n интервалам истории."""
         pts = list(self._hist)
         if len(pts) < n + 1:
             return (0.0, 0.0)
-        vx = np.mean([pts[-i][1] - pts[-i-1][1] for i in range(1, n+1)])
-        vy = np.mean([pts[-i][2] - pts[-i-1][2] for i in range(1, n+1)])
-        return (float(vx), float(vy))
+        vx = float(np.mean([pts[-i][1] - pts[-i-1][1] for i in range(1, n+1)]))
+        vy = float(np.mean([pts[-i][2] - pts[-i-1][2] for i in range(1, n+1)]))
+        return (vx, vy)
 
-    def _speed(self) -> float:
-        vx, vy = self._velocity()
+    def _speed(self, n: int = 3) -> float:
+        vx, vy = self._velocity(n)
         return np.hypot(vx, vy)
 
-    def _event_allowed(self, ts: float, cooldown: float = 2.0) -> bool:
-        return (ts - self._event_cooldown) >= cooldown
+    # ── Вспомогательные: геометрия ───────────────────────────────────────
 
-    # ── Определение last_hitter ────────────────────────────────────────
+    def _near_wall(self, bx: float, by: float) -> bool:
+        """
+        True, если мяч внутри корта, но в пределах WALL_MARGIN px от любой стороны.
+        Такое изменение направления → отскок от стекла, а не удар игрока.
+        pointPolygonTest: >0 = внутри (значение = расстояние до границы).
+        """
+        dist = cv2.pointPolygonTest(
+            np.array(self.calib.corners, dtype=np.float32),
+            (float(bx), float(by)), True)
+        return 0.0 < dist < self.WALL_MARGIN
+
+    # ── Определение last_hitter ──────────────────────────────────────────
 
     def _try_set_hitter(self, ball_px, player_px, ts):
-        if not player_px:
+        if not player_px or len(self._hist) < 5:
             return
-        # Определяем, было ли резкое изменение направления
-        if len(self._hist) >= 5:
-            pts = list(self._hist)
-            v_old = np.array([pts[-3][1]-pts[-5][1], pts[-3][2]-pts[-5][2]], float)
-            v_new = np.array([pts[-1][1]-pts[-3][1], pts[-1][2]-pts[-3][2]], float)
-            n_old = np.linalg.norm(v_old)
-            n_new = np.linalg.norm(v_new)
-            if n_old > 2 and n_new > 2:
-                cos_a = np.dot(v_old, v_new) / (n_old * n_new)
-                dir_changed = cos_a < 0.5   # было 0.3 (>72°) → теперь >60°: ловим больше ударов
-            else:
-                dir_changed = False
-        else:
-            dir_changed = True
 
-        if not dir_changed:
+        pts   = list(self._hist)
+        v_old = np.array([pts[-3][1]-pts[-5][1], pts[-3][2]-pts[-5][2]], float)
+        v_new = np.array([pts[-1][1]-pts[-3][1], pts[-1][2]-pts[-3][2]], float)
+        n_old = np.linalg.norm(v_old)
+        n_new = np.linalg.norm(v_new)
+
+        if n_old < 2 or n_new < 2:
+            return
+
+        cos_a = np.dot(v_old, v_new) / (n_old * n_new)
+        if cos_a >= 0.5:       # угол < 60° → не удар
             return
 
         bx, by = ball_px
+
+        # ИСКЛЮЧЕНИЕ СТЕКЛА: изменение направления у стены → отскок, не удар
+        if self._near_wall(bx, by):
+            return
+
+        if (ts - self._last_hit_ts) <= self.CONTACT_COOLDOWN:
+            return
+
         nearest, nd = None, float('inf')
         for pid, (px, py) in player_px.items():
             d = np.hypot(bx - px, by - py)
             if d < nd:
                 nd, nearest = d, pid
 
-        if nd < self.CONTACT_DIST and (ts - self._last_hit_ts) > self.CONTACT_COOLDOWN:
-            self._last_hitter  = nearest
-            self._last_hit_ts  = ts
-            self._crossed_net  = False   # сбрасываем флаг перелёта
-            self._was_flying   = False   # новый удар — сбрасываем флаг полёта
-            self._hitter_side  = self.calib.net_side(bx, by)   # запоминаем сторону
-            self._out_frames   = 0       # сбрасываем счётчик аута
+        if nd > self.CONTACT_DIST:
+            return
 
-    # ── Перелёт через сетку ────────────────────────────────────────────
+        # Регистрируем удар
+        self._last_hitter    = nearest
+        self._last_hit_ts    = ts
+        self._crossed_net    = False
+        self._hitter_side    = self.calib.net_side(bx, by)
+        self._out_frames     = 0
+        self._max_speed_opp  = 0.0   # сброс трекинга виннера
+        self._slow_frames    = 0
 
-    def _check_crossed_net(self, ts):
+    # ── Перелёт через сетку ──────────────────────────────────────────────
+
+    def _check_crossed_net(self):
         pts = list(self._hist)
-        for i in range(max(0, len(pts)-4), len(pts)-1):
+        for i in range(max(0, len(pts) - 4), len(pts) - 1):
             p1 = (pts[i][1],   pts[i][2])
             p2 = (pts[i+1][1], pts[i+1][2])
             if self.calib.crosses_net(p1, p2):
                 self._crossed_net = True
                 break
 
-    # ── Ошибка: сетка ─────────────────────────────────────────────────
+    # ── Ошибка: сетка ────────────────────────────────────────────────────
 
     def _check_net_error(self, ball_px, ts):
-        if not self._event_allowed(ts):
+        if (ts - self._ts_net) < self.COOLDOWN_NET:
             return
-        # Если мяч уже перелетел через сетку — это ралли, а не ошибка в сетку
         if self._crossed_net:
-            return
+            return   # мяч перелетел — это ралли, не ошибка
+
         bx, by = ball_px
-        near_net = abs(by - self.calib.net_y(bx)) < self.NET_ZONE_PX
-        if not near_net or self._speed() >= self.NET_STOP_SPEED:
+        if abs(by - self.calib.net_y(bx)) > self.NET_ZONE_PX:
             return
-        # Дополнительная проверка: мяч должен быть на стороне бьющего,
-        # а не уже перелетел и остановился у сетки со стороны соперника
+        if self._speed() >= self.NET_STOP_SPEED:
+            return
+
+        # Мяч должен быть на стороне бьющего
         if self._hitter_side is not None:
             if self.calib.net_side(bx, by) != self._hitter_side:
                 return
-        self._record_error("net_errors", ts)
 
-    # ── Ошибка: аут ───────────────────────────────────────────────────
+        # Мяч должен двигаться В СТОРОНУ сетки (не от неё)
+        # net_side=0 → мяч выше сетки (меньший Y) → должен двигаться вниз (vy > 0)
+        # net_side=1 → мяч ниже сетки (больший Y) → должен двигаться вверх (vy < 0)
+        _, vy = self._velocity(5)
+        if abs(vy) > 0.5:   # проверяем только при явном движении по Y
+            if self._hitter_side == 0 and vy < 0:
+                return   # движется ПРОЧЬ от сетки
+            if self._hitter_side == 1 and vy > 0:
+                return   # движется ПРОЧЬ от сетки
+
+        self._record_error("net_errors", ts, "net")
+
+    # ── Ошибка: аут ──────────────────────────────────────────────────────
 
     def _check_out_error(self, ball_px, ts):
+        if (ts - self._ts_out) < self.COOLDOWN_OUT:
+            return
         bx, by = ball_px
         dist = cv2.pointPolygonTest(
             np.array(self.calib.corners, dtype=np.float32),
             (float(bx), float(by)), True)
         if dist < self.OUT_MARGIN:
-            self._out_frames += 1
-            # Аут подтверждаем только при нескольких кадрах подряд за кортом
-            # (защита от шума трекера)
-            if self._out_frames >= self.OUT_MIN_FRAMES and self._event_allowed(ts):
-                self._record_error("out_errors", ts)
+            # Мяч должен двигаться, а не «дрожать» на месте из-за шума детектора
+            if self._speed() >= self.OUT_SPEED_MIN:
+                self._out_frames += 1
+                if self._out_frames >= self.OUT_MIN_FRAMES:
+                    self._record_error("out_errors", ts, "out")
+            else:
+                self._out_frames = 0
         else:
-            self._out_frames = 0   # мяч вернулся в корт — сбрасываем счётчик
+            self._out_frames = 0
 
-    # ── Виннер ────────────────────────────────────────────────────────
+    # ── Виннер ───────────────────────────────────────────────────────────
 
     def _check_winner(self, ball_px, player_px, team_map, ts):
-        if not self._event_allowed(ts):
+        if (ts - self._ts_winner) < self.COOLDOWN_WINNER:
             return
         if not self._crossed_net or self._last_hitter is None:
             return
@@ -912,51 +979,73 @@ class EventDetector:
 
         bx, by = ball_px
 
-        # Мяч должен быть на стороне СОПЕРНИКА (не бьющего)
+        # Мяч должен быть на стороне СОПЕРНИКА
         if self._hitter_side is not None:
             if self.calib.net_side(bx, by) == self._hitter_side:
+                # Вернулся на сторону бьющего → сброс накопленных данных
+                self._max_speed_opp = 0.0
+                self._slow_frames   = 0
                 return
 
         spd = self._speed()
 
-        # Обновляем флаг «мяч был в полёте» на стороне соперника
-        if spd > self.SPEED_FLYING:
-            self._was_flying = True
+        # Накапливаем пиковую скорость на стороне соперника
+        if spd > self._max_speed_opp:
+            self._max_speed_opp = spd
 
-        # Виннер = мяч летел → замедлился после отскока.
-        # Если ещё в полёте или ни разу не разогнался — ждём.
-        if not self._was_flying or spd > self.SPEED_BOUNCE:
+        # Считаем кадры с «остановкой» (отскок от корта)
+        if spd <= self.WINNER_BOUNCE_SPEED:
+            self._slow_frames += 1
+        else:
+            self._slow_frames = 0
+            return   # мяч ещё летит — ждём
+
+        # Виннер требует:
+        # 1. Мяч разогнался до минимальной пиковой скорости (реальный удар)
+        if self._max_speed_opp < self.WINNER_MIN_SPEED_OPP:
             return
 
+        # 2. Мяч медленно N кадров подряд (приземление/остановка)
+        if self._slow_frames < self.WINNER_SLOW_FRAMES:
+            return
+
+        # 3. Мяч внутри корта (отскочил, не улетел в аут)
         if not self.calib.in_court(bx, by):
             return
 
-        # Все соперники должны быть далеко от точки посадки
+        # 4. Все соперники далеко от точки приземления
         opponents = {pid: pos for pid, pos in player_px.items()
                      if team_map.get(pid) != hitter_team}
         if not opponents:
             return
 
-        min_dist = min(np.hypot(bx-px, by-py) for px, py in opponents.values())
+        if min(np.hypot(bx-px, by-py) for px, py in opponents.values()) < self.WINNER_DIST:
+            return
 
-        if min_dist > self.WINNER_DIST:
-            pid = self._last_hitter
-            if pid in self.stats:
-                self.stats[pid]["winners"] += 1
-            self._last_hitter  = None
-            self._crossed_net  = False
-            self._was_flying   = False
-            self._event_cooldown = ts
-
-    # ── Запись ошибки ──────────────────────────────────────────────────
-
-    def _record_error(self, key: str, ts: float):
-        if self._last_hitter is not None and self._last_hitter in self.stats:
-            self.stats[self._last_hitter][key] += 1
+        # Записываем виннер
+        pid = self._last_hitter
+        if pid in self.stats:
+            self.stats[pid]["winners"] += 1
         self._last_hitter    = None
         self._crossed_net    = False
-        self._event_cooldown = ts
-        # Очищаем историю мяча чтобы не словить дубль
+        self._max_speed_opp  = 0.0
+        self._slow_frames    = 0
+        self._ts_winner      = ts
+
+    # ── Запись ошибки ────────────────────────────────────────────────────
+
+    def _record_error(self, key: str, ts: float, kind: str):
+        if self._last_hitter is not None and self._last_hitter in self.stats:
+            self.stats[self._last_hitter][key] += 1
+        self._last_hitter   = None
+        self._crossed_net   = False
+        self._max_speed_opp = 0.0
+        self._slow_frames   = 0
+        if kind == "net":
+            self._ts_net = ts
+        elif kind == "out":
+            self._ts_out = ts
+        # Очищаем историю чтобы не зарегистрировать двойное событие
         self._hist.clear()
 
 
